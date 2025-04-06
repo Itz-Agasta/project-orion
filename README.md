@@ -27,5 +27,5 @@ Follow the [official docs](https://docs.astral.sh/uv/getting-started/installatio
 
 4. **Start the application:**
    ```bash
-   uv run orion/vision.py
+   uv run main.py
    ```
