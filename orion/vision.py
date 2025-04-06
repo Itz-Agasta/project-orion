@@ -1,99 +1,141 @@
 import cv2
+import time
 import mediapipe as mp
+from .gestures import detect_activation_gesture
+from .utils import compute_bounding_box, compute_box_area, compute_arm_vector, draw_arm
+from .tracker import STATE_IDLE, STATE_TRACKING
 
 mp_drawing = mp.solutions.drawing_utils
 mp_hands = mp.solutions.hands
 
-def process_gesture(hand_landmarks, image, width, height):
+def process_frame(image, hands, pose, tracker):
     """
-    Processes hand landmarks to check for the specific gesture:
-    - Index (8) and middle (12) fingers extended.
-    - Ring (16) and pinky (20) fingers curled.
+    Process a video frame for hand gesture detection and arm tracking.
     
-    If the gesture is detected, calculates and returns the midpoint between
-    the index and middle fingertips (in pixel coordinates).
-    """
-    landmarks = hand_landmarks.landmark
-
-    # Check finger states using y-coordinates.
-    index_extended = landmarks[8].y < landmarks[7].y
-    middle_extended = landmarks[12].y < landmarks[11].y
-    ring_curled = landmarks[16].y > landmarks[15].y
-    pinky_curled = landmarks[20].y > landmarks[19].y
-
-    # If the gesture matches: index and middle extended, ring and pinky curled.
-    if index_extended and middle_extended and ring_curled and pinky_curled:
-        index_tip_pixel = (int(landmarks[8].x * width), int(landmarks[8].y * height))
-        middle_tip_pixel = (int(landmarks[12].x * width), int(landmarks[12].y * height))
-
-        x_mid = (index_tip_pixel[0] + middle_tip_pixel[0]) // 2
-        y_mid = (index_tip_pixel[1] + middle_tip_pixel[1]) // 2
-        return (x_mid, y_mid)
+    Args:
+        image: BGR image from camera
+        hands: MediaPipe hands solution instance
+        pose: MediaPipe pose solution instance
+        tracker: Tracker object maintaining the current state
     
-    return None
-
-def draw_hand_annotations(image, hand_landmarks):
+    Returns:
+        Processed image with visualizations based on current tracking state
     """
-    Draws landmarks and connections on the image using MediaPipe utilities.
-    """
-    mp_drawing.draw_landmarks(
-        image, 
-        hand_landmarks, 
-        mp_hands.HAND_CONNECTIONS,
-        mp_drawing.DrawingSpec(color=(121, 22, 76), thickness=2, circle_radius=4),
-        mp_drawing.DrawingSpec(color=(250, 44, 250), thickness=2, circle_radius=2)
-    )
-
-def process_frame(image, hands):
-    """
-    Processes a single frame:
-    - Converts colors and flips the image.
-    - Detects hand landmarks.
-    - Processes each hand for gesture detection and draws annotations.
-    
-    Returns the processed image.
-    """
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    # Flip image for a selfie-view and convert to RGB.
     image = cv2.flip(image, 1)
-    
-    image.flags.writeable = False
-    results = hands.process(image)
-    image.flags.writeable = True
-
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     height, width, _ = image.shape
 
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            draw_hand_annotations(image, hand_landmarks)
-            
-            midpoint = process_gesture(hand_landmarks, image, width, height)
-            if midpoint:
-                cv2.circle(image, midpoint, 10, (0, 0, 255), -1)
-                cv2.putText(image, "Gesture Detected", (10, 30), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    # Run hand and pose detections.
+    image.flags.writeable = False
+    hand_results = hands.process(rgb_image)
+    pose_results = pose.process(rgb_image)
+    image.flags.writeable = True
 
-                print(f"Aim Turret at: {midpoint}") # Debugging output
+    activation_candidates = []         # List to store hand candidates for activation gesture
     
+    # In tracking mode, use the tracked hand side
+    side_to_track = tracker.tracked_hand_side.lower() if tracker.state == STATE_TRACKING and tracker.tracked_hand_side else 'none'
+    
+    # In tracking mode: draw arm landmarks and the aim vector.
+    if tracker.state == STATE_TRACKING and pose_results.pose_landmarks:
+        shoulder, elbow, wrist, arm_vector = compute_arm_vector(pose_results.pose_landmarks, width, height, side_to_track)
+        draw_arm(image, shoulder, elbow, wrist)
+        endpoint = (wrist[0] + arm_vector[0], wrist[1] + arm_vector[1])
+        cv2.arrowedLine(image, wrist, endpoint, (0, 255, 255), 3)
+        cv2.putText(image, f"Arm Vector: {arm_vector}", (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        print(f"Pointing Coordinates: {endpoint}")
+    
+    # In idle mode: draw hand landmarks.
+    if tracker.state == STATE_IDLE and hand_results.multi_hand_landmarks:
+        for hand_landmarks in hand_results.multi_hand_landmarks:
+            mp_drawing.draw_landmarks(
+                image, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                mp_drawing.DrawingSpec(color=(121, 22, 76), thickness=2, circle_radius=4),
+                mp_drawing.DrawingSpec(color=(250, 44, 250), thickness=2, circle_radius=2)
+            )
+    
+    # Process hand landmarks for gesture detection (without drawing in tracking mode).
+    if hand_results.multi_hand_landmarks and hand_results.multi_handedness:
+        for idx, hand_landmarks in enumerate(hand_results.multi_hand_landmarks):
+            # Get handedness from MediaPipe.
+            handedness = hand_results.multi_handedness[idx].classification[0].label  # "Left" or "Right"
+            if detect_activation_gesture(hand_landmarks):
+                box = compute_bounding_box(hand_landmarks, width, height)
+                area = compute_box_area(box)
+                activation_candidates.append((hand_landmarks, area, box, handedness))
+                if tracker.state == STATE_IDLE:
+                    cv2.rectangle(image,
+                                  (int(box[0]), int(box[1])),
+                                  (int(box[2]), int(box[3])),
+                                  (0, 255, 0), 2)
+    
+    # Display current mode on screen.         
+    mode_text = f"Mode: Tracking ({tracker.tracked_hand_side})" if tracker.state == STATE_TRACKING else "Mode: Idle"
+    cv2.putText(image, mode_text, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
+    # ----- State Machine Handling -----
+    if tracker.state == STATE_IDLE:
+        if activation_candidates:
+            candidate = max(activation_candidates, key=lambda x: x[1])
+            if tracker.activation_start_time is None:
+                tracker.activation_start_time = time.time()
+                tracker.tracked_hand = candidate[0]
+                tracker.tracked_box_area = candidate[1]
+                tracker.tracked_hand_side = candidate[3]
+            else:
+                # Check if the candidate remains similar.
+                if abs(candidate[1] - tracker.tracked_box_area) / tracker.tracked_box_area < 0.2:
+                    elapsed = time.time() - tracker.activation_start_time
+                    cv2.putText(image, f"Activating: {elapsed:.1f}s", (10, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    if elapsed >= 1.5:
+                        tracker.state = STATE_TRACKING
+                        tracker.activation_start_time = None
+                        cv2.putText(image, "Tracking Activated", (10, 110),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                else:
+                    tracker.activation_start_time = time.time()
+                    tracker.tracked_hand = candidate[0]
+                    tracker.tracked_box_area = candidate[1]
+                    tracker.tracked_hand_side = candidate[3]
+        else:
+            tracker.activation_start_time = None
+            tracker.tracked_hand = None
+            tracker.tracked_box_area = None
+            tracker.tracked_hand_side = None
+            cv2.putText(image, "Waiting for Activation Gesture", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    
+    elif tracker.state == STATE_TRACKING:
+        # Check for hand gesture to turn off tracking.
+        if activation_candidates:
+            candidate = max(activation_candidates, key=lambda x: x[1])
+            if tracker.activation_start_time is None:
+                tracker.activation_start_time = time.time()
+            else:
+                elapsed = time.time() - tracker.activation_start_time
+                cv2.putText(image, f"Deactivating: {elapsed:.1f}s", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                if elapsed >= 1.5:
+                    tracker.reset()
+                    cv2.putText(image, "Tracking Deactivated", (10, 140),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        else:
+            tracker.activation_start_time = None
+
+        # If pose landmarks are lost, start a lost timer.
+        if not pose_results.pose_landmarks:
+            if tracker.lost_start_time is None:
+                tracker.lost_start_time = time.time()
+            elif time.time() - tracker.lost_start_time >= 3:
+                tracker.reset()
+                cv2.putText(image, "Tracking Lost", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        else:
+            tracker.lost_start_time = None
+
     return image
 
-def main():
-    cap = cv2.VideoCapture(0)
-    with mp_hands.Hands(min_detection_confidence=0.8, min_tracking_confidence=0.5) as hands:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            processed_frame = process_frame(frame, hands)
-            cv2.imshow('Hand Tracking', processed_frame)
-
-            if cv2.waitKey(10) & 0xFF == ord('q'):
-                break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
